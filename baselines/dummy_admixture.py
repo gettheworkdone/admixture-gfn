@@ -187,6 +187,10 @@ def run_experiment(cfg: OmegaConf) -> None:
             )
 
     reward_module = AdmixtureGraphRewardModule(snp_path=snp_path)
+    log.info(
+        "Initialising reward module with SNP override: %s",
+        snp_path if snp_path is not None else "<default ArcticData.txt>",
+    )
     env = AdmixtureGraphEnvironment(
         num_leaves=cfg.environment.num_leaves,
         num_admx_nodes=cfg.environment.num_admx_nodes,
@@ -219,6 +223,8 @@ def run_experiment(cfg: OmegaConf) -> None:
         optimizer=optimizer,
         baseline=jnp.array(0.0, dtype=jnp.float32),
     )
+
+    train_state_params, train_state_static = eqx.partition(train_state, eqx.is_array)
 
     train_state_params, train_state_static = eqx.partition(train_state, eqx.is_array)
 

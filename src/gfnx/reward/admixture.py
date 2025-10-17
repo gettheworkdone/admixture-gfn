@@ -12,10 +12,6 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 from jax import random
-import os, shutil, tempfile
-from pathlib import Path
-import warnings
-from jax import debug
 from jax.scipy.special import multigammaln
 
 from ..base import BaseRewardModule, TLogReward, TReward, TRewardParams
@@ -26,7 +22,32 @@ log = logging.getLogger(__name__)
 
 
 def _save_variance_correction(mat: jnp.ndarray, folder: str) -> str:
-    """Persist a variance-correction matrix to ``folder`` and return the path."""
+    """Persist the additive variance correction used in :func:`xnn_to_covariance_wrapper_directly`.
+
+    Parameters
+    ----------
+    mat:
+        Square matrix with shape ``(P, P)`` where ``P`` equals the number of non-outgroup
+        populations in the reduced covariance system.  Each entry ``mat[i, j]`` corresponds to the
+        correction that must be added to the empirical covariance between populations ``i`` and
+        ``j`` so the reduced Wishart covariance matches the theoretical expectation derived from
+        the bootstrap analysis.
+    folder:
+        Directory on disk where the text representation should be written.  The file name is
+        always ``variance_correction.txt`` to match the naming convention expected by the original
+        AdmixtureBayes tooling.
+
+    Returns
+    -------
+    str
+        Absolute path to the persisted file.  This path is later injected back into the graph
+        serialization so downstream sampling or scoring code can reload the correction matrix.
+
+    Notes
+    -----
+    The matrix is written row-by-row with space-separated floating point values so that the file
+    can be consumed by AdmixtureBayes' graph writer without additional binary dependencies.
+    """
     path = os.path.join(folder, "variance_correction.txt")
     mat = jnp.array(mat)
     with open(path, 'w') as f:
@@ -36,8 +57,34 @@ def _save_variance_correction(mat: jnp.ndarray, folder: str) -> str:
     return path
 
 def variance_mean_based(sample_of_matrices: Iterable[jnp.ndarray]) -> float:
-    """Estimate the Wishart degrees of freedom from a bootstrap of covariance matrices."""
+    """Estimate the Wishart degrees of freedom implied by a bootstrap sample.
+
+    Parameters
+    ----------
+    sample_of_matrices:
+        Iterable of covariance matrices produced by :func:`estimate_degrees_of_freedom_scaled_fast`.
+        Each element has shape ``(P, P)`` where ``P`` is the number of populations after removing
+        the outgroup.  The matrices are averaged across different bootstrap resamples of SNP
+        windows and therefore each element encodes an empirical covariance estimate.
+
+    Returns
+    -------
+    float
+        The maximum-likelihood estimate of the Wishart degrees of freedom ``ν`` used in the
+        log-likelihood evaluation.  The estimator is derived from the relationship between the
+        second moment of the Wishart distribution and the sample variance of the bootstrapped
+        covariances.
+
+    Notes
+    -----
+    The computation follows the derivation in AdmixtureBayes: we compute the matrix ``M`` of
+    squared means, combine it with the element-wise variances, and form the ratio ``num / den``
+    which algebraically isolates ``ν``.  The resulting scalar is constrained to ``(2, 999900)`` to
+    match the numerical guard rails in the original project.  Rich logging is emitted so that the
+    bootstrap stability can be diagnosed if the estimator approaches the bounds.
+    """
     sample = jnp.array(sample_of_matrices)
+    log.info("variance_mean_based: received %d bootstrap draws with population size %d", sample.shape[0], sample.shape[1])
     mean_wishart = jnp.mean(sample, axis=0)
     var_wishart = jnp.var(sample, axis=0)
     var_rom_mean_wishart = jnp.square(mean_wishart) + jnp.outer(jnp.diag(mean_wishart), jnp.diag(mean_wishart))
@@ -51,7 +98,26 @@ def variance_mean_based(sample_of_matrices: Iterable[jnp.ndarray]) -> float:
 
 
 def get_partitions(lines: Sequence[str], blocksize: int) -> list[list[str]]:
-    """Split ``lines`` into contiguous blocks of size ``blocksize`` for bootstrapping."""
+    """Slice the SNP records into contiguous bootstrap windows.
+
+    Parameters
+    ----------
+    lines:
+        Sequence of strings representing SNP records in TreeMix format *without* the header line.
+        Each element contains comma-separated minor/major allele counts for every population.
+    blocksize:
+        Number of SNP rows that should be grouped into a single bootstrap block.  The resulting
+        block defines the sampling unit used when estimating the Wishart degrees of freedom.
+
+    Returns
+    -------
+    list[list[str]]
+        A list of windows where each inner list contains ``blocksize`` contiguous SNP rows, except
+        possibly the last block which duplicates the final ``blocksize`` rows if the total number of
+        SNPs is an exact multiple of ``blocksize``.  These windows feed into
+        :func:`make_single_files` which materialises them on disk for the empirical covariance
+        computation.
+    """
     list_of_lists = []
     for i in range(0, len(lines) - blocksize, blocksize):
         list_of_lists.append(lines[i:(i + blocksize)])
@@ -61,7 +127,27 @@ def get_partitions(lines: Sequence[str], blocksize: int) -> list[list[str]]:
 
 
 def combine_covs(tuple_covs: Sequence[tuple[jnp.ndarray, float]], indices: jnp.ndarray) -> jnp.ndarray:
-    """Average a set of covariance matrices given bootstrap ``indices`` and scaling factors."""
+    """Average bootstrap covariance estimates using the matching scaling factors.
+
+    Parameters
+    ----------
+    tuple_covs:
+        Sequence where each element is a tuple ``(Σ_k, m_k)``.  ``Σ_k`` is the empirical covariance
+        matrix with shape ``(P, P)`` produced from the ``k``-th bootstrap block and ``m_k`` is the
+        scalar heterozygosity scaling factor associated with that block.
+    indices:
+        One-dimensional integer array selecting which bootstrap blocks to include.  The array is
+        typically drawn with replacement to approximate the expected covariance under the Wishart
+        model.
+
+    Returns
+    -------
+    jnp.ndarray
+        Weighted average covariance matrix with shape ``(P, P)`` where each selected block
+        contributes ``Σ_k / m_k``.  This helper mirrors the high-level logic of
+        :func:`estimate_degrees_of_freedom_scaled_fast` but is rarely called directly in the modern
+        pipeline.
+    """
     cov_sum = jnp.zeros_like(tuple_covs[0][0])
     scale_sum = jnp.array(0.0)
     for i in indices:
@@ -71,10 +157,41 @@ def combine_covs(tuple_covs: Sequence[tuple[jnp.ndarray, float]], indices: jnp.n
 
 
 def make_covariances(filenames: Sequence[str], varcovfilename: str, cores: int, **kwargs):
-    """Compute empirical covariance matrices for the bootstrap blocks listed in ``filenames``."""
+    """Materialise empirical covariances for every bootstrap block on disk.
+
+    Parameters
+    ----------
+    filenames:
+        Sequence of file paths created by :func:`make_single_files`.  Each file contains a header
+        line followed by ``blocksize`` SNP rows for all populations.
+    varcovfilename:
+        Location where the variance correction matrix should be written.  The helper propagates the
+        path so that :class:`ScaledEstimator` can reuse it when saving corrections.
+    cores:
+        Number of CPU workers requested by the AdmixtureBayes CLI.  The current implementation is
+        single-threaded but keeps the parameter for API compatibility.
+    **kwargs:
+        Passed straight to :func:`empirical_covariance_wrapper_directly` to configure the estimator
+        (e.g. population ordering and reducer node).
+
+    Returns
+    -------
+    list[tuple[jnp.ndarray, float]] | list[jnp.ndarray]
+        When ``return_also_mscale`` is present in ``kwargs`` each element becomes ``(Σ_k, m_k)`` as
+        described in :func:`combine_covs`.  Otherwise a bare covariance matrix is returned.  Rich
+        logging outlines the number of processed windows and the norms of each covariance to assist
+        debugging.
+    """
     covs = []
     for filename in filenames:
-        covs.append(empirical_covariance_wrapper_directly(filename, varcovfilename, **kwargs))
+        log.info("make_covariances: computing covariance for bootstrap block %s", filename)
+        cov = empirical_covariance_wrapper_directly(filename, varcovfilename, **kwargs)
+        if isinstance(cov, tuple):
+            cov_matrix = cov[0]
+        else:
+            cov_matrix = cov
+        log.info("make_covariances: covariance Frobenius norm %.6f", float(jnp.linalg.norm(cov_matrix)))
+        covs.append(cov)
     try:
         for fil in filenames:
             os.remove(fil)
@@ -84,7 +201,29 @@ def make_covariances(filenames: Sequence[str], varcovfilename: str, cores: int, 
 
 
 def make_single_files(filename: str, blocksize: int, verbose_level: str = 'normal', fileprefix: str = "") -> list[str]:
-    """Create bootstrap SNP files by slicing ``filename`` into contiguous windows."""
+    """Split a TreeMix SNP file into on-disk bootstrap shards.
+
+    Parameters
+    ----------
+    filename:
+        Path to the TreeMix formatted SNP file.  The first line contains population labels while
+        the remaining ``N`` lines contain comma-separated ``minor,major`` counts for every SNP.
+    blocksize:
+        Number of SNPs assigned to each bootstrap block.  The function ensures that every block has
+        exactly ``blocksize`` rows by duplicating the final block when necessary.
+    verbose_level:
+        When not set to ``"silent"`` the helper prints the total number of SNPs and the number of
+        emitted blocks to standard output.  This mirrors the behaviour of the original
+        AdmixtureBayes scripts.
+    fileprefix:
+        Directory prefix under which the ``temp_adbayes`` scratch directory should be created.
+
+    Returns
+    -------
+    list[str]
+        Absolute paths to the temporary bootstrap files.  Each file preserves the header line from
+        ``filename`` so that downstream consumers can recover the population ordering.
+    """
     filenames = []
     os.mkdir(fileprefix + os.sep + "temp_adbayes")
     filename_reduced = fileprefix + os.sep + "temp_adbayes" + os.sep + filename.split(os.sep)[-1] + 'boot.'
@@ -101,6 +240,7 @@ def make_single_files(filename: str, blocksize: int, verbose_level: str = 'norma
             g.write(first_line)
             g.writelines(lins)
         filenames.append(new_filename)
+    log.info("make_single_files: generated %d bootstrap files with blocksize %d", len(filenames), blocksize)
     return filenames
 
 def estimate_degrees_of_freedom_scaled_fast(
@@ -111,7 +251,44 @@ def estimate_degrees_of_freedom_scaled_fast(
     verbose_level: str = 'normal',
     **kwargs,
 ) -> float:
-    """Estimate the bootstrap degrees of freedom used in the Wishart likelihood."""
+    """Estimate the Wishart degrees of freedom ``ν`` via repeated bootstrap resampling.
+
+    Parameters
+    ----------
+    filename:
+        Path to the TreeMix SNP file that seeds the bootstrap.  The file must contain one header
+        line followed by per-SNP population counts.
+    varcovfilename:
+        Destination for the variance correction associated with the reduced covariance.  The
+        estimator writes temporary corrections during each bootstrap pass and finally overwrites the
+        file with the correction for the full dataset.
+    bootstrap_blocksize:
+        Number of SNP rows per bootstrap shard.  This hyper-parameter controls the variance of the
+        estimator—smaller values increase the number of shards and therefore stabilise the Wishart
+        parameter estimate.
+    cores:
+        Unused placeholder kept for compatibility with AdmixtureBayes' CLI.  Multi-processing would
+        replicate the computation across shards if implemented.
+    verbose_level:
+        Controls whether :func:`make_single_files` prints additional status lines.
+    **kwargs:
+        Propagated to :func:`empirical_covariance_wrapper_directly`, typically containing the
+        ``est`` dictionary with estimator configuration.
+
+    Returns
+    -------
+    float
+        Estimated Wishart degrees of freedom ``ν`` derived from the Frobenius variance of the
+        bootstrapped covariance matrices.
+
+    Notes
+    -----
+    The function mimics the AdmixtureBayes pipeline: it splits the dataset, computes reduced
+    covariance matrices for each shard, samples 100 bootstrap combinations, and aggregates them via
+    :func:`variance_mean_based`.  Logging statements record the number of generated shards, the
+    distribution of scaling factors, and the final ``ν`` so discrepancies with the reference
+    implementation can be diagnosed easily.
+    """
     single_files = make_single_files(filename, blocksize=bootstrap_blocksize, verbose_level=verbose_level,
                                      fileprefix=(varcovfilename[0:(len(varcovfilename)-24)]))
     assert len(single_files) > 1, f'There are {len(single_files)} bootstrapped SNP blocks and that is not enough. Either add more data or lower the --bootstrap_blocksize'
@@ -123,6 +300,7 @@ def estimate_degrees_of_freedom_scaled_fast(
     indices = random.randint(key, (100, K), minval=0, maxval=K)
     covs_arr = jnp.stack([cov for cov, _ in single_covs])
     scales_arr = jnp.array([scale for _, scale in single_covs])
+    log.info("estimate_dof: %d bootstrap shards, mean heterozygosity scale %.6f", K, float(jnp.mean(scales_arr)))
     selected_covs = covs_arr[indices]             # shape (100, K, p, p)
     selected_scales = scales_arr[indices]         # shape (100, K)
     cov_sum = jnp.sum(selected_covs, axis=1)      # (100, p, p)
@@ -132,18 +310,53 @@ def estimate_degrees_of_freedom_scaled_fast(
 
 
 def reduce_covariance(covmat: jnp.ndarray) -> jnp.ndarray:
-    """Project a covariance matrix into the space with the outgroup removed."""
+    """Remove the ancestral population by projecting onto the non-outgroup subspace.
+
+    Parameters
+    ----------
+    covmat:
+        Full covariance matrix with shape ``(P, P)`` where population index ``0`` corresponds to the
+        reference (outgroup) population.  The matrix typically arises from ``p2 @ p2.T`` in
+        :meth:`ScaledEstimator.estimate_from_p`.
+
+    Returns
+    -------
+    jnp.ndarray
+        Reduced covariance matrix with shape ``(P-1, P-1)`` that drops the ancestral dimension by
+        left- and right-multiplying with a difference operator.  The resulting matrix represents the
+        covariance between pairwise allele frequency *differences* and is the sufficient statistic
+        used by the Wishart likelihood in AdmixtureBayes.
+    """
     reducer = jnp.insert(jnp.eye(covmat.shape[0] - 1), 0, -1, axis=1)
     return reducer @ covmat @ reducer.T
 
 
 def nan_divide(dividend: jnp.ndarray, divisor: jnp.ndarray) -> jnp.ndarray:
-    """Safely divide two arrays, returning NaNs where the divisor is zero."""
+    """Divide element-wise while propagating missing-data sentinels.
+
+    Both ``dividend`` and ``divisor`` share shape ``(P, S)`` with ``P`` populations and ``S`` SNPs.
+    The helper is used when allele totals ``n`` contain zeros—the resulting undefined frequencies are
+    mapped to ``NaN`` and subsequently ignored in the downstream reductions.
+    """
     return jnp.where(divisor == 0, jnp.nan, dividend / divisor)
 
 
 def nan_inner_product(a: jnp.ndarray, b: jnp.ndarray) -> float:
-    """Compute the mean product of ``a`` and ``b`` while ignoring shared NaNs."""
+    """Compute a nan-safe Frobenius inner product between matrices ``a`` and ``b``.
+
+    Parameters
+    ----------
+    a, b:
+        Arrays with identical shape ``(P, S)``.  NaNs denote SNP/population combinations that were
+        filtered out earlier in the pipeline.  Elements with NaNs in either ``a`` or ``b`` are
+        skipped, mirroring how AdmixtureBayes handles masked sites.
+
+    Returns
+    -------
+    float
+        Mean of the element-wise product over all valid entries.  When all entries are ``NaN`` the
+        function returns ``0.0`` while emitting a warning to highlight the degenerate block.
+    """
     avg = jnp.nanmean(a * b)
     if jnp.isnan(avg):
         warnings.warn('There is an entry in the covariance matrix that is set to 0 because all the relevant data was nan.', UserWarning)
@@ -152,7 +365,24 @@ def nan_inner_product(a: jnp.ndarray, b: jnp.ndarray) -> float:
 
 
 def nan_product(A: jnp.ndarray, B: jnp.ndarray) -> jnp.ndarray:
-    """Matrix multiply ``A`` and ``B`` while ignoring NaN entries."""
+    """Perform matrix multiplication while masking out missing entries.
+
+    Parameters
+    ----------
+    A:
+        Left operand with shape ``(P, S)`` containing allele-frequency differences between each
+        population and the outgroup.  NaNs indicate loci that were dropped because of zero allele
+        totals.
+    B:
+        Right operand with shape ``(S, P)`` (often ``A.T``) containing the same NaN pattern.
+
+    Returns
+    -------
+    jnp.ndarray
+        Matrix with shape ``(P, P)`` that averages only over valid SNPs.  Every entry ``(i, j)``
+        equals the dot product of populations ``i`` and ``j`` divided by the number of valid loci in
+        their shared mask.  Zero denominators trigger a warning and yield ``0`` for that entry.
+    """
     mask_A = ~jnp.isnan(A)
     mask_B = ~jnp.isnan(B)
     numerator = jnp.nan_to_num(A, nan=0.0) @ jnp.nan_to_num(B, nan=0.0)
@@ -166,21 +396,72 @@ def nan_product(A: jnp.ndarray, B: jnp.ndarray) -> jnp.ndarray:
 
 
 def m_scaler(allele_freqs: jnp.ndarray) -> float:
-    """Return the heterozygosity scaling factor for allele frequencies."""
+    """Compute the heterozygosity normaliser ``m`` used by :class:`ScaledEstimator`.
+
+    Parameters
+    ----------
+    allele_freqs:
+        Array with shape ``(P, S)`` containing minor allele frequencies ``p`` for each population and
+        SNP.  The outgroup population is located at index ``0``.  NaNs are allowed and are ignored in
+        the means.
+
+    Returns
+    -------
+    float
+        The scalar ``m = mean_s(mean_p(p_s * (1 - p_s)))`` which rescales the empirical covariance so
+        that it matches the theoretical Wishart expectation.  Higher values correspond to more
+        heterozygous populations and therefore shrink the covariance.
+    """
     s = jnp.nanmean(allele_freqs, axis=0)
     scaler = jnp.nanmean(s * (1.0 - s))
+    log.info("m_scaler: mean heterozygosity %.6f", float(scaler))
     return scaler
 
 
 def var(p: jnp.ndarray, n: jnp.ndarray) -> float:
-    """Empirical binomial variance averaged across SNPs."""
+    """Compute the per-population binomial variance used in bias corrections.
+
+    Parameters
+    ----------
+    p:
+        Allele frequency matrix with shape ``(P, S)``.  Each column corresponds to a SNP and each row
+        to a population.
+    n:
+        Matching allele-count totals with shape ``(P, S)``.  Entries with ``n <= 1`` are ignored
+        because they do not convey variance information.
+
+    Returns
+    -------
+    float
+        Mean of ``p * (1 - p) / (n - 1)`` over valid entries.  This value feeds into
+        :func:`reduced_covariance_bias_correction` to undo the small-sample bias caused by finite
+        allele counts.
+    """
     mask = n > 1
     entries = jnp.where(mask, p * (1 - p) / (n - 1), jnp.nan)
     return jnp.nanmean(entries)
 
 
 def reduced_covariance_bias_correction(p: jnp.ndarray, n: jnp.ndarray, n_outgroup: int = 0) -> jnp.ndarray:
-    """Compute the additive bias correction matrix for the reduced covariance."""
+    """Construct the additive bias correction matrix ``B`` for reduced covariances.
+
+    Parameters
+    ----------
+    p:
+        Allele-frequency matrix with shape ``(P, S)`` including the outgroup in the first row.
+    n:
+        Total allele counts with identical shape to ``p``.
+    n_outgroup:
+        Integer index of the outgroup population (defaults to ``0``).
+
+    Returns
+    -------
+    jnp.ndarray
+        Square bias matrix with shape ``(P-1, P-1)``.  The diagonal consists of the per-population
+        averages ``E[p(1-p)/(n-1)]`` while the off-diagonal entries repeat the outgroup correction.
+        This matrix is divided by ``m`` in :meth:`ScaledEstimator.estimate_from_p` and added to the
+        reduced covariance to correct for finite-sample effects.
+    """
     mask = n > 1
     vals = jnp.where(mask, p * (1 - p) / (n - 1), jnp.nan)
     Bs = jnp.nanmean(vals, axis=1)
@@ -190,21 +471,76 @@ def reduced_covariance_bias_correction(p: jnp.ndarray, n: jnp.ndarray, n_outgrou
     return jnp.diag(Bs_no_out) + outgroup_b * jnp.ones((Bs_no_out.size, Bs_no_out.size))
 
 class ScaledEstimator(object):
-    """Estimate the reduced covariance matrix used in the admixture likelihood."""
+    """Estimator for the reduced allele-frequency covariance used in the reward function.
+
+    The estimator mirrors AdmixtureBayes' *scaled covariance* routine: allele counts are converted to
+    frequencies, centred relative to the outgroup, and renormalised by the heterozygosity factor
+    ``m``.  The class stores configuration about whether the variance correction should be attached
+    to the resulting graph files, and exposes ``__call__`` so it can be used interchangeably with the
+    historical implementation.
+    """
 
     def __init__(self, add_variance_correction_to_graph=False, save_variance_correction=True, nodes=None, varcovname=""):
-        """Initialise the estimator with bookkeeping flags for variance corrections."""
+        """Initialise bookkeeping for variance correction side effects.
+
+        Parameters
+        ----------
+        add_variance_correction_to_graph:
+            When ``True`` the estimator writes the correction matrix next to the empirical covariance
+            so graph serialisation can embed it directly.
+        save_variance_correction:
+            Toggle for persisting the correction matrix.  Disabling persistence is useful for pure
+            likelihood evaluations where the caller handles bias terms manually.
+        nodes:
+            Sequence of population names expected in the final graph ordering.  The attribute is
+            stored for compatibility with legacy code; the estimator itself does not need it.
+        varcovname:
+            Path where the correction matrix should be written when ``save_variance_correction`` is
+            ``True``.
+        """
         self.add_variance_correction_to_graph = add_variance_correction_to_graph
         self.nodes = nodes
         self.save_variance_correction = save_variance_correction
         self.variancecorrectionname = varcovname
 
     def subtract_ancestral_and_get_outgroup(self, p):
-        """Return allele frequencies relative to the first (outgroup) population."""
+        """Shift allele frequencies so the outgroup population becomes the origin.
+
+        Parameters
+        ----------
+        p:
+            Array of allele frequencies with shape ``(P, S)``.  Row ``0`` corresponds to the outgroup.
+
+        Returns
+        -------
+        jnp.ndarray
+            Allele-frequency differences with identical shape.  Each row ``i`` now represents
+            ``p_i - p_outgroup`` which is the sufficient statistic for the reduced covariance.
+        """
         return p - p[0, :]
 
     def __call__(self, xs, ns, extra_info={}):
-        """Estimate the reduced covariance matrix from allele counts ``xs`` and totals ``ns``."""
+        """Estimate the reduced covariance matrix from raw allele counts.
+
+        Parameters
+        ----------
+        xs:
+            Minor allele counts with shape ``(P, S)`` where ``P`` is the number of populations and
+            ``S`` is the number of SNPs.
+        ns:
+            Total allele counts with matching shape.  The per-population allele frequencies are given
+            by ``xs / ns`` with NaNs inserted when ``ns`` is zero.
+        extra_info:
+            Mutable dictionary receiving side-channel diagnostics.  Currently only ``"m_scale"`` is
+            populated so the caller can rescale other statistics consistently.
+
+        Returns
+        -------
+        jnp.ndarray
+            Reduced covariance matrix with shape ``(P-1, P-1)`` ready for Wishart scoring.  The
+            matrix encodes pairwise covariance between allele-frequency differences across all
+            non-outgroup populations.
+        """
         if (ns == 0).any().item():
             warnings.warn('There were 0s in the allele-totals, inducing nans and slower estimation.', UserWarning)
             ps = nan_divide(xs, ns)
@@ -213,7 +549,37 @@ class ScaledEstimator(object):
         return self.estimate_from_p(ps, ns=ns, extra_info=extra_info)
 
     def estimate_from_p(self, p, ns=None, extra_info={}):
-        """Implement the Scaled AdmixtureBayes covariance estimator."""
+        """Implement the scaled covariance estimator using allele frequencies ``p``.
+
+        Parameters
+        ----------
+        p:
+            Allele frequency matrix with shape ``(P, S)``.  Row ``0`` is the outgroup reference.
+        ns:
+            Optional allele totals with shape ``(P, S)``.  Required when the bias correction is
+            enabled because it depends on ``n``.  Passing ``None`` skips bias corrections.
+        extra_info:
+            Dictionary used to communicate the heterozygosity scaling factor ``m`` back to the
+            caller.  The dictionary is mutated in-place.
+
+        Returns
+        -------
+        jnp.ndarray
+            Reduced covariance matrix with shape ``(P-1, P-1)``.  The method performs the following
+            operations in order:
+
+            1. Subtract the outgroup frequencies to create ``p2``.
+            2. Compute ``m = p2 @ p2.T / S`` or its NaN-aware analogue.
+            3. Divide by the heterozygosity scaler ``m_scale`` to match the Wishart expectation.
+            4. Project the matrix with :func:`reduce_covariance` to remove the outgroup row/column.
+            5. Add the bias correction ``B / m_scale`` if allele totals were provided.
+            6. Optionally persist the correction matrix for downstream graph writers.
+
+        Notes
+        -----
+        Extensive logging captures the intermediate norms and scaling factors so the numerical
+        stability of the estimator can be inspected from training logs.
+        """
         p2 = self.subtract_ancestral_and_get_outgroup(p)
         if jnp.isnan(p2).any().item():
             warnings.warn('Nans found in the allele frequency differences matrix => slower execution', UserWarning)
@@ -221,6 +587,7 @@ class ScaledEstimator(object):
         else:
             m = jnp.dot(p2, p2.T) / p2.shape[1]
         scaling_factor = m_scaler(p)
+        log.info("ScaledEstimator: raw covariance Frobenius norm %.6f", float(jnp.linalg.norm(m)))
         extra_info['m_scale'] = scaling_factor
         m = m / scaling_factor
         m = reduce_covariance(m)
@@ -230,10 +597,32 @@ class ScaledEstimator(object):
                 for i in range(b.shape[0]):
                     line = ' '.join(str(float(x)) for x in b[i])
                     f.write(line + '\n')
+        log.info("ScaledEstimator: reduced covariance Frobenius norm %.6f", float(jnp.linalg.norm(m)))
         return m
 
 def read_freqs(new_filename: str):
-    """Parse an AdmixtureBayes SNP file into per-population allele counts."""
+    """Parse a TreeMix-formatted SNP file into population-specific counts.
+
+    Parameters
+    ----------
+    new_filename:
+        Path to the file produced either by the user or by :func:`make_single_files`.  The first
+        line lists population names and each subsequent line contains ``minor,major`` pairs for every
+        population.
+
+    Returns
+    -------
+    tuple[list[str], list[list[float]], list[list[float]]]
+        * ``names`` – population labels as strings.
+        * ``pop_sizes`` – total allele counts per population and SNP with shape ``(S, P)``.
+        * ``minors`` – minor allele counts mirroring ``pop_sizes``.
+
+    Notes
+    -----
+    The function keeps the original nested Python-list structure so legacy code that expects lists
+    rather than NumPy arrays continues to work.  Conversion to ``jnp.ndarray`` happens in
+    :func:`get_xs_and_ns_from_treemix_file`.
+    """
     with open(new_filename, 'r') as f:
         names = f.readline().split()
         pop_sizes = []
@@ -252,15 +641,50 @@ def read_freqs(new_filename: str):
 
 
 def get_xs_and_ns_from_treemix_file(snp_file: str):
-    """Load allele counts ``xs`` and totals ``ns`` from a TreeMix-format file."""
+    """Load per-population allele counts and totals from disk.
+
+    Parameters
+    ----------
+    snp_file:
+        Path to a TreeMix-formatted SNP file.
+
+    Returns
+    -------
+    tuple[jnp.ndarray, jnp.ndarray, list[str]]
+        * ``xs`` – minor allele counts with shape ``(P, S)``.
+        * ``ns`` – total allele counts with the same shape.
+        * ``names`` – list of population labels in file order.
+
+    Notes
+    -----
+    The arrays are transposed relative to the ``minors``/``pop_sizes`` lists returned by
+    :func:`read_freqs` so that populations index the first dimension.  Detailed logging captures the
+    resulting shapes, making it easy to confirm the dataset layout.
+    """
     names, ns, minors = read_freqs(snp_file)
     xs = jnp.array(minors, dtype=float).T
     ns = jnp.array(ns, dtype=float).T
+    log.info("get_xs_and_ns_from_treemix_file: loaded xs shape %s ns shape %s", xs.shape, ns.shape)
     return xs, ns, names
 
 
 def order_covariance(xnn_tuple, outgroup: str = ''):
-    """Reorder the allele matrices so the ``outgroup`` is in the first position."""
+    """Permute allele counts so the designated outgroup appears first.
+
+    Parameters
+    ----------
+    xnn_tuple:
+        Tuple ``(xs, ns, names)`` with the same structure as produced by
+        :func:`get_xs_and_ns_from_treemix_file`.
+    outgroup:
+        Population label that should become index ``0`` in ``xs`` and ``ns``.
+
+    Returns
+    -------
+    tuple[jnp.ndarray, jnp.ndarray, list[str]]
+        Reordered allele counts, totals, and names.  The returned arrays keep their original shapes
+        while the list of names is updated to reflect the new ordering.
+    """
     xs, ns, names = xnn_tuple
     assert outgroup in names, 'The outgroup was not found in the data. Did you spell it correctly?'
     n_outgroup = names.index(outgroup)
@@ -273,55 +697,182 @@ def order_covariance(xnn_tuple, outgroup: str = ''):
     xs = jnp.insert(xs, 0, xs_o, axis=0)
     ns = jnp.insert(ns, 0, ns_o, axis=0)
     names = [names_o] + names
+    log.info("order_covariance: moved outgroup '%s' to front; resulting order %s", outgroup, names)
     return xs, ns, names
 
 
 def _get_permutation(actual: Sequence[str], target: Sequence[str]):
-    """Return the permutation that reorders ``actual`` into the ``target`` order."""
+    """Map the ordering of ``actual`` labels to the requested ``target`` sequence.
+
+    Parameters
+    ----------
+    actual:
+        Iterable of unique labels describing the current ordering.
+    target:
+        Iterable describing the desired ordering.
+
+    Returns
+    -------
+    list[int]
+        Indices that permute ``actual`` into ``target``.  The helper is used to align covariance
+        matrices with graph node orderings after the outgroup has been removed.
+    """
     val_to_index = {val: key for key, val in enumerate(actual)}
     return [val_to_index[val] for val in target]
 
 
 def reorder_reduced_covariance(cov: jnp.ndarray, names: list[str], full_nodes: list[str], outgroup: str = ''):
-    """Align a reduced covariance matrix with the ordering expected by the graph nodes."""
+    """Align the reduced covariance matrix with the global node ordering.
+
+    Parameters
+    ----------
+    cov:
+        Reduced covariance matrix with shape ``(P-1, P-1)`` in the ordering returned by
+        :func:`order_covariance`.
+    names:
+        Population names in the same order as ``cov`` (including the outgroup at index ``0``).
+    full_nodes:
+        Population names expected by the downstream graph, including the outgroup.
+    outgroup:
+        Name of the outgroup population.
+
+    Returns
+    -------
+    jnp.ndarray
+        Covariance matrix whose rows and columns match ``full_nodes`` with the outgroup removed.
+    """
     names2 = deepcopy(names)
     full_nodes2 = deepcopy(full_nodes)
     names2.remove(outgroup)
     full_nodes2.remove(outgroup)
     indices = jnp.array(_get_permutation(names2, full_nodes2), dtype=int)
-    return cov[jnp.ix_(indices, indices)]
+    reordered = cov[jnp.ix_(indices, indices)]
+    log.info("reorder_reduced_covariance: aligned matrix to nodes %s", full_nodes2)
+    return reordered
 
 
 def emp_cov_to_file(m: jnp.ndarray, filename: str = 'emp_covimport', nodes: Sequence[str] | None = None) -> None:
-    """Store an empirical covariance matrix in AdmixtureBayes text format."""
+    """Write the reduced covariance matrix to disk alongside node labels.
+
+    Parameters
+    ----------
+    m:
+        Reduced covariance matrix with shape ``(P-1, P-1)`` whose ordering corresponds to
+        ``nodes``.
+    filename:
+        Destination file path.  The resulting file is compatible with AdmixtureBayes utilities.
+    nodes:
+        Sequence of population names excluding the outgroup.  The header line lists the nodes while
+        each subsequent line contains ``<node>`` followed by the corresponding row of ``m``.
+    """
     with open(filename, 'w') as f:
         f.write(' '.join(nodes) + '\n')
         for i, node in enumerate(nodes):
             f.write(node + ' ' + ' '.join(map(str, m[i])) + '\n')
+    log.info("emp_cov_to_file: wrote covariance with shape %s to %s", m.shape, filename)
 
 
 def make_estimator(nodes, reducer, add_variance_correction_to_graph=False, save_variance_correction=True, varcovname=""):
-    """Helper that instantiates :class:`ScaledEstimator` with keyword arguments."""
-    return ScaledEstimator(add_variance_correction_to_graph=add_variance_correction_to_graph,
-                            save_variance_correction=save_variance_correction, varcovname=varcovname)
+    """Construct a :class:`ScaledEstimator` configured for a specific graph.
+
+    Parameters
+    ----------
+    nodes:
+        Population names describing the reduced covariance ordering, typically the internal nodes of
+        the admixture graph excluding the outgroup.
+    reducer:
+        Name of the population that should be treated as the outgroup when centring allele
+        frequencies.
+    add_variance_correction_to_graph:
+        Forwarded to :class:`ScaledEstimator` to control whether the correction matrix is embedded in
+        graph serialisations.
+    save_variance_correction:
+        Forwarded to :class:`ScaledEstimator` to control whether the correction matrix is written to
+        disk.
+    varcovname:
+        Destination path for persisted corrections.
+
+    Returns
+    -------
+    ScaledEstimator
+        Estimator instance ready to process allele count tensors.
+
+    Notes
+    -----
+    The helper mirrors AdmixtureBayes' factory function so configuration dictionaries can be passed
+    straight from Hydra configs without modification.
+    """
+    estimator = ScaledEstimator(add_variance_correction_to_graph=add_variance_correction_to_graph,
+                               save_variance_correction=save_variance_correction, varcovname=varcovname)
+    log.info("make_estimator: configured estimator with reducer '%s' and variance file %s", reducer, varcovname)
+    return estimator
 
 
 def rescale_empirical_covariance(m: jnp.ndarray):
-    """Scale a covariance matrix so its trace matches the AdmixtureBayes expectation."""
+    """Rescale the covariance so its trace matches AdmixtureBayes' analytical expectation.
+
+    Parameters
+    ----------
+    m:
+        Reduced covariance matrix with shape ``(P-1, P-1)``.
+
+    Returns
+    -------
+    tuple[jnp.ndarray, float]
+        ``(m_rescaled, multiplier)`` where ``multiplier`` rescales the covariance to satisfy
+        ``trace(m_rescaled) = P(P+1)/2 - 1``.  The value is appended to the export file for debugging
+        and is used by the original sampler when comparing different bootstrap replicates.
+    """
     n = m.shape[0]
     max_expected_trace = n * (n + 1) / 2 - 1
     multiplier = max_expected_trace / jnp.trace(m)
+    log.info("rescale_empirical_covariance: trace multiplier %.6f", float(multiplier))
     return m * multiplier, multiplier
 
 
 def empirical_covariance_wrapper_directly(snp_data_file: str, varcovfilename: str, **kwargs):
-    """Convenience wrapper that reads SNP data and produces an empirical covariance."""
+    """Load SNP data and compute the reduced covariance via :class:`ScaledEstimator`.
+
+    Parameters
+    ----------
+    snp_data_file:
+        Path to the TreeMix-formatted SNP file.
+    varcovfilename:
+        Destination for the saved variance correction if requested by the estimator configuration.
+    **kwargs:
+        Passed through to :func:`xnn_to_covariance_wrapper_directly`.
+
+    Returns
+    -------
+    jnp.ndarray | tuple[jnp.ndarray, float]
+        Reduced covariance matrix and optionally the heterozygosity scaling factor when
+        ``return_also_mscale`` is present.
+    """
     xnn_tuple = get_xs_and_ns_from_treemix_file(snp_data_file)
     return xnn_to_covariance_wrapper_directly(xnn_tuple, varcovfilename, **kwargs)
 
 
 def xnn_to_covariance_wrapper_directly(xnn_tuple, varcovfilename, **kwargs):
-    """Convert allele count tensors into the reduced covariance representation."""
+    """Convert allele-count tensors directly into the reduced covariance representation.
+
+    Parameters
+    ----------
+    xnn_tuple:
+        Tuple ``(xs, ns, names)`` returned by :func:`get_xs_and_ns_from_treemix_file` or
+        :func:`order_covariance`.
+    varcovfilename:
+        Path for writing variance corrections when requested.
+    **kwargs:
+        Configuration dictionary.  The key ``"est"`` must contain the keyword arguments forwarded to
+        :func:`make_estimator`.
+
+    Returns
+    -------
+    jnp.ndarray | tuple[jnp.ndarray, float]
+        Reduced covariance matrix and optionally the heterozygosity scaling factor.  The function
+        orchestrates reordering, estimator creation, variance correction persistence, and optional
+        rescaling so higher level scripts can remain agnostic of the underlying machinery.
+    """
     est_args = kwargs['est']
     xnn_tuple = order_covariance(xnn_tuple, outgroup=est_args['reducer'])
     xs, ns, names = xnn_tuple
@@ -341,12 +892,44 @@ def xnn_to_covariance_wrapper_directly(xnn_tuple, varcovfilename, **kwargs):
                 line = ' '.join(str(float(x)) for x in vc[i])
                 f.write(line + '\n')
     if 'return_also_mscale' in kwargs and kwargs['return_also_mscale']:
+        log.info("xnn_to_covariance_wrapper_directly: returning covariance with m_scale %.6f", float(extra_info_dic['m_scale']))
         return cov, extra_info_dic['m_scale']
+    log.info("xnn_to_covariance_wrapper_directly: returning covariance with shape %s", cov.shape)
     return cov
 
 
 def get_covariance(input, varcovfilename="", full_nodes=None, reduce_covariance_node=None, estimator_arguments={}, filename=""):
-    """Entry point used by AdmixtureBayes scripts to compute reduced covariances."""
+    """Compute, rescale, and persist the reduced covariance statistic expected by AdmixtureBayes.
+
+    Parameters
+    ----------
+    input:
+        Either a path to a SNP file or an ``(xs, ns, names)`` tuple.  The helper delegates to
+        :func:`empirical_covariance_wrapper_directly` to handle both formats.
+    varcovfilename:
+        Path for saving the variance correction matrix.
+    full_nodes:
+        List of population names in the full graph ordering (including the outgroup).
+    reduce_covariance_node:
+        Name of the outgroup population which should be removed from the reduced covariance.
+    estimator_arguments:
+        Dictionary of keyword arguments forwarded to :func:`make_estimator`.
+    filename:
+        Output path for the empirical covariance file written by :func:`emp_cov_to_file`.
+
+    Returns
+    -------
+    tuple[jnp.ndarray, float]
+        Pair consisting of the rescaled covariance matrix and the scaling multiplier.  Side effects
+        include writing the covariance matrix to ``filename`` and appending the multiplier in the
+        final line for inspection.
+
+    Notes
+    -----
+    The function prints the raw input and logs each major transformation so debugging a failing
+    pipeline involves simply tailing the log output.  The signature matches the AdmixtureBayes API so
+    the reward module can be swapped in without touching the hydra configuration.
+    """
     kwargs = {}
     after_reduce_nodes = deepcopy(full_nodes)
     after_reduce_nodes.remove(reduce_covariance_node)
@@ -358,6 +941,7 @@ def get_covariance(input, varcovfilename="", full_nodes=None, reduce_covariance_
     emp_cov_to_file(statistic[0], filename, after_reduce_nodes)
     with open(filename, 'a') as f:
         f.write('multiplier=' + str(statistic[1]))
+    log.info("get_covariance: wrote covariance to %s with multiplier %.6f", filename, float(statistic[1]))
     return statistic
 
 # (The rest of the code, including tree manipulation functions, remains unchanged.)
@@ -837,6 +1421,7 @@ class AdmixtureGraphRewardModule(
     """Likelihood and prior computation for admixture graphs."""
 
     def __init__(self, snp_path: str | os.PathLike[str] | None = None) -> None:
+        """Optionally seed the module with a preferred SNP file path."""
         super().__init__()
         self._configured_snp_path = (
             Path(snp_path) if snp_path is not None else None
@@ -844,11 +1429,13 @@ class AdmixtureGraphRewardModule(
         self._tmpdir: str | None = None
 
     def close(self) -> None:
+        """Remove temporary artefacts produced during initialisation."""
         if self._tmpdir is not None:
             shutil.rmtree(self._tmpdir, ignore_errors=True)
             self._tmpdir = None
 
     def __del__(self) -> None:  # pragma: no cover - best-effort cleanup
+        """Destructor hook that cleans up temporary directories."""
         self.close()
 
     def init(
@@ -857,12 +1444,7 @@ class AdmixtureGraphRewardModule(
         dummy_state: AdmixtureGraphEnvState,
         snp_path: str | os.PathLike[str] | None = None,
     ):
-        """
-        Pre‑compute all static quantities:  empirical covariance of the leaf
-        populations, heterozygosity scaling, variance‑correction matrix B,
-        bootstrap degrees‑of‑freedom M, and the file that stores B.
-        These values are reused in every call to `compute_posterior_for_dag`.
-        """
+        """Initialise cached statistics derived from the allele count file."""
         self.close()
         self._BL_LO, self._BL_HI = 0.5, 3.0                      # BaseRewardModule init
 
@@ -876,6 +1458,7 @@ class AdmixtureGraphRewardModule(
                 "Provide a valid path via `snp_path`."
             )
 
+        log.info("Loading SNP counts from %s", snp_path)
         self.snp_path = str(snp_path)
         self._configured_snp_path = snp_path
         with snp_path.open("r") as fh:
@@ -956,12 +1539,7 @@ class AdmixtureGraphRewardModule(
         adj: jnp.ndarray,                 # 0/1 JAX array (N×N)
         admix_props: dict | None = None,  # optional {node_name: α}
     ) -> jnp.ndarray:
-        """
-        • Executes the heavy topology manipulation on the host via
-        `jax.pure_callback`, so the outer caller remains JIT‑able.
-        • Re‑uses pre–computed self.emp_cov, self.multiplier, self.df,
-        self.varcov_path, self.pops_wo_out from __init__.
-        """
+        """Return log-likelihood and log-prior for an adjacency matrix."""
         # ------------------------------------------------------------------
         def _impl(adj_host: jnp.ndarray) -> jnp.ndarray:
             A = np.asarray(adj_host, dtype=np.int8)          # mutable matrix
@@ -1096,9 +1674,20 @@ class AdmixtureGraphRewardModule(
         adjacency = state.adjacency_matrix.astype(jnp.int8)
         dones = state.is_terminal
 
+        jax.debug.print(
+            "log_reward batch_size={} terminals={}",
+            adjacency.shape[0],
+            jnp.sum(dones),
+        )
+
         def _evaluate(adj_matrix, done_flag):
             def _compute(a):
                 vals = self.compute_posterior_for_dag(a)
+                jax.debug.print(
+                    "terminal components like={} prior={}",
+                    vals[0],
+                    vals[1],
+                )
                 return jnp.sum(vals)
 
             return jax.lax.cond(
