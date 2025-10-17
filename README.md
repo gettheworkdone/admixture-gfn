@@ -20,12 +20,13 @@ sampling core:
   applying forward and backward actions over adjacency matrices instead of the
   explicit MCMC proposals used in AdmixtureBayes.【F:src/gfnx/environment/admixture.py†L16-L120】
 * **Rewards** – `gfnx.reward.admixture.AdmixtureGraphRewardModule` ports the
-  Wishart-based likelihood components from AdmixtureBayes so the learned
-  policies optimise the same target distribution without running an MCMC
-  chain.【F:src/gfnx/reward/admixture.py†L1-L140】
+  Wishart-based likelihood components from AdmixtureBayes and now contains
+  fully documented helper routines, bootstrap degree-of-freedom estimation,
+  and verbose logging to surface every step of the reward calculation.【F:src/gfnx/reward/admixture.py†L1-L418】
 * **Policies** – instead of hand-crafted proposal kernels, policies are neural
-  networks (or simpler baselines) trained to sample high-reward graphs via GFlowNet
-  objectives.【F:baselines/dummy_admixture.py†L1-L109】
+  networks (or simpler baselines) trained with a trajectory-balance objective
+  that jointly fits forward/backward policies and the log-partition constant of
+  the target reward.【F:baselines/dummy_admixture.py†L62-L214】
 
 The accompanying AdmixtureBayes repository is the canonical reference for the
 statistical model, input file format, and convergence diagnostics; this project
@@ -45,30 +46,59 @@ for policy architectures.
 
 ## Installation
 
-1. Clone the repository and create a Python >=3.10 environment.
-2. Install dependencies. A minimal setup looks like:
+1. Clone the repository and create the conda environment defined in
+   `envs/admixture-gfn.yaml`:
 
    ```bash
-   pip install "jax[cpu]" chex jaxtyping equinox hydra-core jax-tqdm
-   pip install networkx matplotlib numpy pandas scipy
+   conda env create -f envs/admixture-gfn.yaml
+   conda activate admixture-gfn
    ```
 
-   Adapt the JAX installation command to target CUDA/ROCm wheels if desired.
+   The specification targets CPU-only execution (`jax[cpu]`) so it works on
+   machines without a GPU. Feel free to swap the JAX wheel in the YAML file for
+   a CUDA/ROCm build if acceleration is available.
+
+2. Add the local sources to `PYTHONPATH` (or install `gfnx` as a package) so the
+   baseline scripts can import the environment modules:
+
+   ```bash
+   export PYTHONPATH=$PWD/src
+   ```
 
 3. (Optional) Install developer tooling such as `pytest` for the unit tests.
 
 ## Quick start
 
 The `baselines/dummy_admixture.py` script demonstrates end-to-end usage. It
-initialises the GFlowNet environment and reward module, defines a simple uniform
-policy, and runs a short rollout loop to sample trajectories. Launch it with:
+initialises the GFlowNet environment, instantiates the reward module (printing
+out the resolved Arctic SNP dataset and bootstrap statistics), and trains a
+small MLP policy with the trajectory-balance loss. Training alternates between
+configurable blocks of optimisation steps and validation rollouts while writing
+rich console diagnostics and TensorBoard scalars. Launch it with:
 
 ```bash
 python baselines/dummy_admixture.py
 ```
 
 Hydra reads configuration from `baselines/configs/dummy_admixture.yaml`, so you
-can override arguments via the command line (e.g. `python baselines/dummy_admixture.py environment.num_leaves=6`).
+can override arguments via the command line—for example:
+
+* `training.train_steps_per_phase=10` to control how many gradient steps happen
+  between validation passes.
+* `validation.num_envs=16` to change how many graphs are sampled during each
+  evaluation block.
+* `policy.hidden_size=256 policy.depth=3` to widen/deepen the MLP without
+  touching the source code.
+
+The training loop emits detailed per-step diagnostics via `jax.debug.print`,
+while the Python logger surfaces environment and optimiser metadata before
+training begins.【F:baselines/dummy_admixture.py†L124-L214】 TensorBoard traces
+are written under `tensorboard/` in the Hydra run directory; point TensorBoard
+at that folder to inspect loss/reward curves:
+
+```bash
+tensorboard --logdir tensorboard
+```
 
 ## Testing
 

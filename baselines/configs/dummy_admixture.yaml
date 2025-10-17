@@ -5,6 +5,12 @@ eval_init_seed: 2
 num_train_steps: 200
 num_envs: 3
 
+training:
+  train_steps_per_phase: 20
+
+validation:
+  num_envs: 10
+
 environment:
   num_leaves: 11
   num_admx_nodes: 10
@@ -13,13 +19,13 @@ policy:
   hidden_size: 128
   depth: 2
   entropy_coef: 0.01
-  baseline_momentum: 0.1
 
 optimizer:
   learning_rate: 0.001
 
 reward:
-  snp_path: allele_counts.txt
+  snp_path: null
 
 logging:
   tqdm_print_rate: 100
+  tensorboard_dir: tensorboard
