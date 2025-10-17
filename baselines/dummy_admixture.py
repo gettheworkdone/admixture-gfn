@@ -178,12 +178,34 @@ def train_step(
         masked_backward_logits = mask_logits(
             backward_logits_flat, invalid_backward_mask_flat
         )
-        backward_log_probs_flat = jax.nn.log_softmax(masked_backward_logits, axis=-1)
+        backward_log_probs_flat = jax.nn.log_softmax(
+            masked_backward_logits, axis=-1
+        )
         chosen_backward_logprob_flat = jnp.take_along_axis(
             backward_log_probs_flat,
             backward_actions_flat[..., None],
             axis=-1,
         ).squeeze(-1)
+        chosen_invalid_mask_flat = jnp.take_along_axis(
+            invalid_backward_mask_flat,
+            backward_actions_flat[..., None],
+            axis=-1,
+        ).squeeze(-1)
+        chosen_backward_logprob_flat = jnp.where(
+            chosen_invalid_mask_flat, 0.0, chosen_backward_logprob_flat
+        )
+        _ = jax.lax.cond(
+            jnp.any(chosen_invalid_mask_flat),
+            lambda _: (
+                debug.print(
+                    "invalid backward transitions detected: {}",
+                    jnp.sum(chosen_invalid_mask_flat),
+                ),
+                jnp.array(0, dtype=jnp.int32),
+            )[1],
+            lambda _: jnp.array(0, dtype=jnp.int32),
+            operand=jnp.array(0, dtype=jnp.int32),
+        )
         backward_logprob = chosen_backward_logprob_flat.reshape(action.shape)
         masked_backward_logprob = jnp.where(transition_mask, backward_logprob, 0.0)
         backward_logprob_sum = jnp.sum(masked_backward_logprob, axis=1)
@@ -318,7 +340,9 @@ def run_experiment(cfg: OmegaConf) -> None:
 
     optimizer = optax.adam(cfg.optimizer.learning_rate)
     params, _ = eqx.partition(model, eqx.is_array)
-    opt_state = optimizer.init(params)
+    init_log_z = jnp.array(0.0, dtype=jnp.float32)
+    trainable_template = {"policy": params, "log_z": init_log_z}
+    opt_state = optimizer.init(trainable_template)
     log.info("Optimiser initialised with learning_rate=%s", cfg.optimizer.learning_rate)
 
     train_state = TrainState(
@@ -329,7 +353,7 @@ def run_experiment(cfg: OmegaConf) -> None:
         model=model,
         opt_state=opt_state,
         optimizer=optimizer,
-        log_z=jnp.array(0.0, dtype=jnp.float32),
+        log_z=init_log_z,
     )
 
     tensorboard_dir = Path(cfg.logging.tensorboard_dir)
