@@ -222,6 +222,8 @@ def run_experiment(cfg: OmegaConf) -> None:
 
     train_state_params, train_state_static = eqx.partition(train_state, eqx.is_array)
 
+    train_state_params, train_state_static = eqx.partition(train_state, eqx.is_array)
+
     @functools.partial(jax.jit, donate_argnums=(1,))
     def train_step_wrapper(idx: int, train_state_params):
         train_state = eqx.combine(train_state_params, train_state_static)
