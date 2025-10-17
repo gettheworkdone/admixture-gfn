@@ -45,24 +45,15 @@ for policy architectures.
 
 ## Installation
 
-1. Clone the repository and create the conda environment defined in
-   `envs/admixture-gfn.yaml`:
+1. Clone the repository and create a Python >=3.10 environment.
+2. Install dependencies. A minimal setup looks like:
 
    ```bash
-   conda env create -f envs/admixture-gfn.yaml
-   conda activate admixture-gfn
+   pip install "jax[cpu]" chex jaxtyping equinox hydra-core jax-tqdm
+   pip install networkx matplotlib numpy pandas scipy
    ```
 
-   The specification targets CPU-only execution (`jax[cpu]`) so it works on
-   machines without a GPU. Feel free to swap the JAX wheel in the YAML file for
-   a CUDA/ROCm build if acceleration is available.
-
-2. Add the local sources to `PYTHONPATH` (or install `gfnx` as a package) so the
-   baseline scripts can import the environment modules:
-
-   ```bash
-   export PYTHONPATH=$PWD/src
-   ```
+   Adapt the JAX installation command to target CUDA/ROCm wheels if desired.
 
 3. (Optional) Install developer tooling such as `pytest` for the unit tests.
 
