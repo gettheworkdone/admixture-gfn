@@ -9,5 +9,17 @@ environment:
   num_leaves: 11
   num_admx_nodes: 10
 
+policy:
+  hidden_size: 128
+  depth: 2
+  entropy_coef: 0.01
+  baseline_momentum: 0.1
+
+optimizer:
+  learning_rate: 0.001
+
+reward:
+  snp_path: allele_counts.txt
+
 logging:
   tqdm_print_rate: 100
