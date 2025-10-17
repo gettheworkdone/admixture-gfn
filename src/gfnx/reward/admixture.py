@@ -5,6 +5,7 @@ import numpy as np
 import networkx as nx
 from jax import random
 import os, shutil, tempfile
+from pathlib import Path
 import warnings
 from jax import debug
 from jax.scipy.special import multigammaln
@@ -716,23 +717,51 @@ def _merge_pops(pops):
 class AdmixtureGraphRewardModule(
     BaseRewardModule[AdmixtureGraphEnvState, AdmixtureGraphEnvParams]
 ):
-    """
-    TODO: add annotation
-    """
+    """Likelihood and prior computation for admixture graphs."""
 
-    def init(self, rng_key: chex.PRNGKey, dummy_state: AdmixtureGraphEnvState, snp_path: str = "/disk/10tb/home/shmelev/admixture-gfn/src/gfnx/reward/ArcticData.txt"):
+    def __init__(self, snp_path: str | os.PathLike[str] | None = None) -> None:
+        super().__init__()
+        self._configured_snp_path = (
+            Path(snp_path) if snp_path is not None else None
+        )
+        self._tmpdir: str | None = None
+
+    def close(self) -> None:
+        if self._tmpdir is not None:
+            shutil.rmtree(self._tmpdir, ignore_errors=True)
+            self._tmpdir = None
+
+    def __del__(self) -> None:  # pragma: no cover - best-effort cleanup
+        self.close()
+
+    def init(
+        self,
+        rng_key: chex.PRNGKey,
+        dummy_state: AdmixtureGraphEnvState,
+        snp_path: str | os.PathLike[str] | None = None,
+    ):
         """
         Pre‑compute all static quantities:  empirical covariance of the leaf
         populations, heterozygosity scaling, variance‑correction matrix B,
         bootstrap degrees‑of‑freedom M, and the file that stores B.
         These values are reused in every call to `compute_posterior_for_dag`.
         """
-        super().__init__()   
-        self._BL_LO, self._BL_HI = 0.5, 3.0                      # BaseRewardModule init 
+        self.close()
+        self._BL_LO, self._BL_HI = 0.5, 3.0                      # BaseRewardModule init
 
         # ---------- load allele counts ------------------------------------
-        self.snp_path = snp_path
-        with open(self.snp_path, "r") as fh:
+        configured = self._configured_snp_path if snp_path is None else Path(snp_path)
+        default_path = Path(__file__).with_name("ArcticData.txt")
+        snp_path = configured if configured is not None else default_path
+        if not snp_path.is_file():
+            raise FileNotFoundError(
+                f"SNP dataset not found at '{snp_path}'. "
+                "Provide a valid path via `snp_path`."
+            )
+
+        self.snp_path = str(snp_path)
+        self._configured_snp_path = snp_path
+        with snp_path.open("r") as fh:
             header = fh.readline().strip().split()
             if "Yoruba" not in header:
                 raise ValueError("Header must contain outgroup 'Yoruba'.")
@@ -802,10 +831,10 @@ class AdmixtureGraphRewardModule(
 
 
     def compute_posterior_for_dag(
-    self,
-    adj: jnp.ndarray,                 # 0/1 JAX array (N×N)
-    admix_props: dict | None = None,  # optional {node_name: α}
-) -> tuple[float, float]:
+        self,
+        adj: jnp.ndarray,                 # 0/1 JAX array (N×N)
+        admix_props: dict | None = None,  # optional {node_name: α}
+    ) -> jnp.ndarray:
         """
         • Executes the heavy topology manipulation on the host via
         `jax.pure_callback`, so the outer caller remains JIT‑able.
@@ -926,8 +955,7 @@ class AdmixtureGraphRewardModule(
         # -------- call via pure_callback so outer code can be JIT‑compiled
         out_shape = jax.ShapeDtypeStruct((2,), jnp.float32)
         res = jax.pure_callback(_impl, out_shape, adj)
-        # debug.print("posterior = {}, {}", res[0], res[1])
-        return res[0], res[1]
+        return res
 
 
     def log_reward(
@@ -937,41 +965,22 @@ class AdmixtureGraphRewardModule(
     ) -> TLogReward:
         """TODO: add annotation"""
 
-        # debug.print("DEBUG MARKER")
+        adjacency = state.adjacency_matrix.astype(jnp.int8)
+        dones = state.is_terminal
 
-        log_revards = []
-        key = jax.random.PRNGKey(42)
+        def _evaluate(adj_matrix, done_flag):
+            def _compute(a):
+                vals = self.compute_posterior_for_dag(a)
+                return jnp.sum(vals)
 
-        # debug.print('BBBBBBBBBBBBBBBBBBBBBBB {}', state.adjacency_matrix[0].astype(int))
+            return jax.lax.cond(
+                done_flag,
+                _compute,
+                lambda _: jnp.array(0.0, dtype=jnp.float32),
+                adj_matrix,
+            )
 
-        # debug.print('CCCCCCCCCCCCCCCCCC {}', state.is_terminal)
-
-        # idx, = jnp.nonzero(state.is_terminal)        # shape (K,)
-        # finished_envs = state.adjacency_matrix[idx]  # shape (K, N, N)
-
-        for env in state.adjacency_matrix:                 # env: bool/int JAX array
-            # if state.is_terminal[i] == True:
-            # env = state.adjacency_matrix[i]
-            # debug.print('BBBBBBBBBBBBBBBBBBBBBBB {}', env.astype(int))
-            # key, sub = jax.random.split(key)
-            # rand_w   = jax.random.uniform(sub, shape=env.shape,
-            #                             minval=0.1, maxval=1.0)
-            # A        = jnp.where(env == 1, rand_w, 0.0)     # still JAX
-
-            # debug.print("MASK = {}", state.num_unmasked_nodes, )
-
-            # print('GOGOGOGOGGO')
-
-            log_r, _ = self.compute_posterior_for_dag(env.astype(int))
-            log_revards.append(log_r)    
-    # for env in state.adjacency_matrix:
-    #     random_weights = np.random.uniform(low=0.1, high=1.0, size=env.shape)
-    #     env_np = np.where(np.array(env) == 1, random_weights, 0)
-    #     A = np.array(env_np) # drops on CPU, I'll fix it later
-    #     G = nx.from_numpy_array(A, create_using=nx.DiGraph)
-    #     log_reward, _ = compute_posterior_for_dag(self.snp_path, G)
-    #     log_revards.append(log_reward)
-        return jnp.array(log_revards)
+        return jax.vmap(_evaluate)(adjacency, dones)
 
         # print(state.adjacency_matrix.shape)
         # assert False
