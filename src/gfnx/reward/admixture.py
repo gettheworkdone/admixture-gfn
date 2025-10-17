@@ -12,6 +12,10 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 from jax import random
+import os, shutil, tempfile
+from pathlib import Path
+import warnings
+from jax import debug
 from jax.scipy.special import multigammaln
 
 from ..base import BaseRewardModule, TLogReward, TReward, TRewardParams
@@ -833,7 +837,6 @@ class AdmixtureGraphRewardModule(
     """Likelihood and prior computation for admixture graphs."""
 
     def __init__(self, snp_path: str | os.PathLike[str] | None = None) -> None:
-        """Optionally seed the module with a preferred SNP file path."""
         super().__init__()
         self._configured_snp_path = (
             Path(snp_path) if snp_path is not None else None
@@ -841,13 +844,11 @@ class AdmixtureGraphRewardModule(
         self._tmpdir: str | None = None
 
     def close(self) -> None:
-        """Remove temporary artefacts produced during initialisation."""
         if self._tmpdir is not None:
             shutil.rmtree(self._tmpdir, ignore_errors=True)
             self._tmpdir = None
 
     def __del__(self) -> None:  # pragma: no cover - best-effort cleanup
-        """Destructor hook that cleans up temporary directories."""
         self.close()
 
     def init(
@@ -856,7 +857,12 @@ class AdmixtureGraphRewardModule(
         dummy_state: AdmixtureGraphEnvState,
         snp_path: str | os.PathLike[str] | None = None,
     ):
-        """Initialise cached statistics derived from the allele count file."""
+        """
+        Pre‑compute all static quantities:  empirical covariance of the leaf
+        populations, heterozygosity scaling, variance‑correction matrix B,
+        bootstrap degrees‑of‑freedom M, and the file that stores B.
+        These values are reused in every call to `compute_posterior_for_dag`.
+        """
         self.close()
         self._BL_LO, self._BL_HI = 0.5, 3.0                      # BaseRewardModule init
 
@@ -870,7 +876,6 @@ class AdmixtureGraphRewardModule(
                 "Provide a valid path via `snp_path`."
             )
 
-        log.info("Loading SNP counts from %s", snp_path)
         self.snp_path = str(snp_path)
         self._configured_snp_path = snp_path
         with snp_path.open("r") as fh:
@@ -951,7 +956,12 @@ class AdmixtureGraphRewardModule(
         adj: jnp.ndarray,                 # 0/1 JAX array (N×N)
         admix_props: dict | None = None,  # optional {node_name: α}
     ) -> jnp.ndarray:
-        """Return log-likelihood and log-prior for an adjacency matrix."""
+        """
+        • Executes the heavy topology manipulation on the host via
+        `jax.pure_callback`, so the outer caller remains JIT‑able.
+        • Re‑uses pre–computed self.emp_cov, self.multiplier, self.df,
+        self.varcov_path, self.pops_wo_out from __init__.
+        """
         # ------------------------------------------------------------------
         def _impl(adj_host: jnp.ndarray) -> jnp.ndarray:
             A = np.asarray(adj_host, dtype=np.int8)          # mutable matrix
@@ -1086,20 +1096,9 @@ class AdmixtureGraphRewardModule(
         adjacency = state.adjacency_matrix.astype(jnp.int8)
         dones = state.is_terminal
 
-        jax.debug.print(
-            "log_reward batch_size={} terminals={}",
-            adjacency.shape[0],
-            jnp.sum(dones),
-        )
-
         def _evaluate(adj_matrix, done_flag):
             def _compute(a):
                 vals = self.compute_posterior_for_dag(a)
-                jax.debug.print(
-                    "terminal components like={} prior={}",
-                    vals[0],
-                    vals[1],
-                )
                 return jnp.sum(vals)
 
             return jax.lax.cond(

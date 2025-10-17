@@ -187,10 +187,6 @@ def run_experiment(cfg: OmegaConf) -> None:
             )
 
     reward_module = AdmixtureGraphRewardModule(snp_path=snp_path)
-    log.info(
-        "Initialising reward module with SNP override: %s",
-        snp_path if snp_path is not None else "<default ArcticData.txt>",
-    )
     env = AdmixtureGraphEnvironment(
         num_leaves=cfg.environment.num_leaves,
         num_admx_nodes=cfg.environment.num_admx_nodes,
@@ -200,12 +196,6 @@ def run_experiment(cfg: OmegaConf) -> None:
 
     num_nodes = env.get_init_state(1).adjacency_matrix.shape[-1]
     obs_dim = num_nodes * num_nodes
-    log.info(
-        "Environment ready: %d nodes, forward actions=%d, backward actions=%d",
-        num_nodes,
-        env.action_space.n,
-        env.backward_action_space.n,
-    )
     model = DummyPolicy(
         n_fwd_actions=env.action_space.n,
         n_bwd_actions=env.backward_action_space.n,
@@ -214,14 +204,10 @@ def run_experiment(cfg: OmegaConf) -> None:
         depth=cfg.policy.depth,
         key=policy_init_key,
     )
-    log.info(
-        "Policy parameters: hidden_size=%d depth=%d", cfg.policy.hidden_size, cfg.policy.depth
-    )
 
     optimizer = optax.adam(cfg.optimizer.learning_rate)
     params, _ = eqx.partition(model, eqx.is_array)
     opt_state = optimizer.init(params)
-    log.info("Optimiser initialised with learning_rate=%s", cfg.optimizer.learning_rate)
 
     train_state = TrainState(
         rng_key=rng_key,
@@ -236,6 +222,8 @@ def run_experiment(cfg: OmegaConf) -> None:
 
     train_state_params, train_state_static = eqx.partition(train_state, eqx.is_array)
 
+    train_state_params, train_state_static = eqx.partition(train_state, eqx.is_array)
+
     @functools.partial(jax.jit, donate_argnums=(1,))
     def train_step_wrapper(idx: int, train_state_params):
         train_state = eqx.combine(train_state_params, train_state_static)
@@ -243,7 +231,7 @@ def run_experiment(cfg: OmegaConf) -> None:
         train_state_params, _ = eqx.partition(train_state, eqx.is_array)
         return train_state_params
 
-    log.info("Start training for %d steps with %d environments", cfg.num_train_steps, cfg.num_envs)
+    log.info("Start training")
     train_state_params = jax.lax.fori_loop(
         lower=0,
         upper=cfg.num_train_steps,
